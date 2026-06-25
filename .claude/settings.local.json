@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx create-vite@latest . --template vue-ts --force)",
+      "Bash(npx vite *)",
+      "Bash(jobs)",
+      "Bash(curl -s http://localhost:5173)",
+      "Bash(curl -s http://localhost:5174)",
+      "Bash(curl -v http://localhost:5174)",
+      "Bash(dir /s \"e:\\\\Demo\\\\src\")",
+      "Bash(ls -la \"e:\\\\Demo\\\\src\\\\utils\" 2>nul)",
+      "Bash(npx vue-tsc *)",
+      "Bash(Start-Process -NoNewWindow npx -ArgumentList \"vite\",\"--port\",\"5173\" -PassThru)",
+      "Bash(Select-Object Id)",
+      "Bash(Get-ChildItem -Path \"e:\\\\Demo\" -Recurse -Force)",
+      "Bash(Select-Object FullName)",
+      "Bash(ConvertTo-Csv -NoTypeInformation)",
+      "Bash(Out-String)",
+      "PowerShell(Get-ChildItem -Path \"e:\\\\Demo\" -Recurse | Select-Object FullName | ForEach-Object { $_.FullName })",
+      "Bash(npm install *)"
+    ],
+    "additionalDirectories": [
+      "e:\\Demo"
+    ]
+  }
+}
