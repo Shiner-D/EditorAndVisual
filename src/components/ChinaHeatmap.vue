@@ -1,20 +1,40 @@
 <script setup lang="ts">
+/**
+ * ChinaHeatmap.vue — 中国省级数据色阶地图
+ *
+ * 依赖：
+ *   - echarts ^5.x  （地图渲染、visualMap 色阶、tooltip）
+ *   - 阿里云 DataV GeoJSON API（中国省级边界数据）
+ *     https://geo.datav.aliyun.com/areas_v3/bound/100000_full.json
+ *
+ * 功能：
+ *   1. 动态拉取省级 GeoJSON 并注册到 ECharts
+ *   2. 支持切换「用户量 / 销售额 / 增长率」三种指标
+ *   3. 鼠标悬停高亮 + Tooltip 显示排名与占比
+ *   4. 右侧统计面板（合计、最高值、TOP 5 榜单）
+ */
 import { ref, onMounted, onUnmounted, nextTick } from 'vue'
 import * as echarts from 'echarts'
 
+// 支持的指标键名联合类型
 type MetricKey = 'users' | 'sales' | 'growth'
 
+// 每条省级数据的结构
 interface DataItem { name: string; value: number }
 
+// ── DOM 引用 & 实例 ──────────────────────────────────────────
+// ref<HTMLDivElement>：绑定到模板中 ref="chartRef" 的 DOM 节点
 const chartRef = ref<HTMLDivElement | null>(null)
+// ECharts 实例，由 echarts.init() 返回，全局唯一
 let chart: echarts.ECharts | null = null
 
-const loading = ref(true)
-const loadError = ref('')
-const activeMetric = ref<MetricKey>('users')
-const hoveredProvince = ref<DataItem | null>(null)
+// ── 响应式状态 ───────────────────────────────────────────────
+const loading = ref(true)          // 是否正在加载 GeoJSON
+const loadError = ref('')          // 加载失败时的错误信息
+const activeMetric = ref<MetricKey>('users')   // 当前激活的指标
+const hoveredProvince = ref<DataItem | null>(null) // 鼠标悬停的省份，用于高亮 TOP5 列表
 
-// ── datasets ────────────────────────────────────────────────
+// ── 数据集 ──────────────────────────────────────────────────
 const allData: Record<MetricKey, DataItem[]> = {
   users: [
     { name: '北京', value: 712 }, { name: '天津', value: 389 },
@@ -75,11 +95,13 @@ const allData: Record<MetricKey, DataItem[]> = {
   ],
 }
 
+// 每个指标的显示配置：标签、单位、色板（从低到高）、副标题
 const metricConfig: Record<MetricKey, { label: string; unit: string; colors: string[]; subtext: string }> = {
   users: {
     label: '年度用户量',
     unit: '万人',
     subtext: '注册用户数量 · 2024年度',
+    // colors 数组从暗（低值）到亮（高值），供 visualMap.inRange 使用
     colors: ['#0a1628', '#0d47a1', '#1565c0', '#1976d2', '#42a5f5', '#90caf9', '#e3f2fd'],
   },
   sales: {
@@ -96,28 +118,37 @@ const metricConfig: Record<MetricKey, { label: string; unit: string; colors: str
   },
 }
 
+// ── 纯计算工具函数 ───────────────────────────────────────────
+
+/** 取某指标所有省份数据中的最大值，用于 visualMap.max */
 function getMax(key: MetricKey) {
   return Math.max(...allData[key].map(d => d.value))
 }
 
+/** 取排名前 n 的省份，默认 5 个，用于右侧 TOP5 榜单 */
 function getTopN(key: MetricKey, n = 5) {
   return [...allData[key]].sort((a, b) => b.value - a.value).slice(0, n)
 }
 
+/** 取某指标所有省份数据之和，增长率指标中用来计算平均值 */
 function getTotal(key: MetricKey) {
   return allData[key].reduce((sum, d) => sum + d.value, 0)
 }
 
+/** 根据指标类型格式化数值为可读字符串 */
 function formatVal(v: number, key: MetricKey) {
   if (key === 'growth') return v.toFixed(1) + '%'
   return v.toLocaleString() + ' ' + metricConfig[key].unit
 }
 
-// ── GeoJSON cleaner ─────────────────────────────────────────
-// Aliyun DataV GeoJSON contains null entries at various levels of the
-// coordinate arrays (null rings, null points). ECharts does not guard
-// against these and throws "Cannot read properties of null (reading '0')".
+// ── GeoJSON 清洗 ─────────────────────────────────────────────
+/**
+ * 阿里云 DataV GeoJSON 在坐标数组的各层级中可能存在 null 值
+ * （空环、空点），ECharts 内部不做保护直接读取 null[0] 会抛错。
+ * 此函数递归过滤所有 null 项，保证数据安全后再注册给 ECharts。
+ */
 function sanitizeGeoJson(geoJson: any): any {
+  // 递归清洗：过滤 null 元素，再对数组子项继续递归
   const cleanCoords = (arr: any): any => {
     if (!Array.isArray(arr)) return arr
     return arr
@@ -127,6 +158,7 @@ function sanitizeGeoJson(geoJson: any): any {
 
   if (Array.isArray(geoJson.features)) {
     geoJson.features = geoJson.features
+      // 过滤 geometry 或 coordinates 为空的 Feature
       .filter((f: any) => f?.geometry?.coordinates != null)
       .map((f: any) => ({
         ...f,
@@ -136,7 +168,16 @@ function sanitizeGeoJson(geoJson: any): any {
   return geoJson
 }
 
-// ── ECharts option builder ──────────────────────────────────
+// ── ECharts 配置构建器 ───────────────────────────────────────
+/**
+ * 根据当前指标键构造完整的 ECharts option 对象。
+ *
+ * ECharts option 主要字段说明：
+ *   backgroundColor  — 画布背景色（十六进制或 rgba）
+ *   tooltip          — 鼠标悬停提示框
+ *   visualMap        — 数据到颜色的映射组件（色阶条）
+ *   series           — 系列数组，此处为地图系列
+ */
 function buildOption(key: MetricKey): echarts.EChartsOption {
   const data = allData[key]
   const cfg = metricConfig[key]
@@ -144,13 +185,21 @@ function buildOption(key: MetricKey): echarts.EChartsOption {
 
   return {
     backgroundColor: '#080e1e',
+
+    // ── tooltip 悬停提示框 ────────────────────────────────────
     tooltip: {
-      trigger: 'item',
-      backgroundColor: 'rgba(6, 10, 24, 0.96)',
-      borderColor: '#3949ab',
-      borderWidth: 1,
-      padding: [10, 14],
-      textStyle: { color: '#e8eaf6', fontSize: 13, fontFamily: 'inherit' },
+      trigger: 'item',            // 触发方式：'item' 表示鼠标悬停到数据项时触发（地图系列必须用此值）
+      backgroundColor: 'rgba(6, 10, 24, 0.96)', // 提示框背景色
+      borderColor: '#3949ab',     // 提示框边框颜色
+      borderWidth: 1,             // 提示框边框宽度（px）
+      padding: [10, 14],          // 内边距 [上下, 左右]（px）
+      textStyle: { color: '#e8eaf6', fontSize: 13, fontFamily: 'inherit' }, // 默认文字样式
+      /**
+       * formatter 自定义提示框内容
+       * @param params.name   — 当前悬停项的名称（省份名，已经过 nameMap 映射）
+       * @param params.value  — 该省份在当前指标的数值；无数据省份为 undefined/NaN
+       * @returns HTML 字符串，ECharts 直接注入到提示框 DOM 中
+       */
       formatter: (params: any) => {
         if (params.value === undefined || params.value === null || isNaN(+params.value)) {
           return `<div style="font-weight:600">${params.name}</div>
@@ -172,29 +221,39 @@ function buildOption(key: MetricKey): echarts.EChartsOption {
           <div style="color:#3f51b5;margin-top:5px;font-size:11px">全国第 ${rank} 位</div>`
       }
     },
+
+    // ── visualMap 视觉映射（色阶条）────────────────────────────
     visualMap: {
-      type: 'continuous',
-      min: 0,
-      max,
-      left: 16,
-      bottom: 50,
-      orient: 'vertical',
-      itemHeight: 160,
-      text: ['高', '低'],
+      type: 'continuous',   // 连续型色阶（另有 'piecewise' 分段型）
+      min: 0,               // 色阶映射的最小值
+      max,                  // 色阶映射的最大值，动态取当前指标最大值
+      left: 16,             // 距容器左边缘距离（px 或百分比）
+      bottom: 50,           // 距容器底边缘距离
+      orient: 'vertical',   // 色阶条方向：'vertical'（竖）或 'horizontal'（横）
+      itemHeight: 160,      // 色阶条长度（px）
+      text: ['高', '低'],   // 两端文字标签，顺序对应 [max端, min端]
       textStyle: { color: '#9fa8da', fontSize: 11 },
-      calculable: true,
+      calculable: true,     // 是否开启手柄拖拽交互（可拖动两端手柄筛选范围）
+      // inRange 定义在值域范围内的视觉通道，color 为颜色列表（从 min→max 插值）
       inRange: { color: cfg.colors },
     },
+
+    // ── series 系列 ───────────────────────────────────────────
     series: [
       {
-        name: cfg.label,
-        type: 'map',
-        map: 'china',
-        roam: true,
-        zoom: 1.2,
-        center: [105, 36],
-        // Aliyun DataV GeoJSON uses full names (e.g. "广东省", "内蒙古自治区"),
-        // while our data uses short names — nameMap bridges the gap.
+        name: cfg.label,    // 系列名称，显示在 tooltip、legend 中
+        type: 'map',        // 系列类型：地图
+        map: 'china',       // 地图名称，必须与 echarts.registerMap() 的第一个参数一致
+        roam: true,         // 是否开启鼠标缩放与平移漫游（true = 开启，也可设 'scale'/'move' 单独开）
+        zoom: 1.2,          // 初始缩放比例（1 = 原始大小）
+        center: [105, 36],  // 初始地图中心点 [经度, 纬度]，用于将地图居中到中国大陆
+        /**
+         * nameMap 省份名称映射表
+         * 阿里云 DataV GeoJSON 使用全称（如"广东省"、"内蒙古自治区"），
+         * 而 allData 使用短名（如"广东"、"内蒙古"）。
+         * ECharts 通过 nameMap 将 GeoJSON 中的 name 转换后与 data[].name 匹配。
+         * 格式：{ GeoJSON全称: 数据短名 }
+         */
         nameMap: {
           '北京市': '北京', '天津市': '天津', '上海市': '上海', '重庆市': '重庆',
           '河北省': '河北', '山西省': '山西', '辽宁省': '辽宁', '吉林省': '吉林',
@@ -207,24 +266,33 @@ function buildOption(key: MetricKey): echarts.EChartsOption {
           '西藏自治区': '西藏', '宁夏回族自治区': '宁夏', '新疆维吾尔自治区': '新疆',
           '香港特别行政区': '香港', '澳门特别行政区': '澳门', '台湾省': '台湾',
         },
+        // emphasis 鼠标悬停高亮样式
         emphasis: {
           label: { show: true, color: '#fff', fontSize: 11, fontWeight: 'bold' },
           itemStyle: { areaColor: '#ffd54f', borderColor: '#fff', borderWidth: 1.5 },
         },
-        selectedMode: false,
+        selectedMode: false, // 禁用点击选中效果（地图仅用于展示，不需要选中态）
+        // itemStyle 默认（非高亮）状态下的样式
         itemStyle: {
-          borderColor: '#1a237e',
-          borderWidth: 0.7,
-          areaColor: cfg.colors[0],
+          borderColor: '#1a237e',  // 省界线颜色
+          borderWidth: 0.7,        // 省界线宽度（px）
+          areaColor: cfg.colors[0], // 无数据省份的填充色（取色板最暗色）
         },
-        label: { show: false },
-        data,
+        label: { show: false }, // 默认不显示省份名称标签（悬停时由 emphasis.label 控制）
+        data,                   // 数据数组，格式：[{ name: '广东', value: 1563 }, ...]
       },
     ],
   }
 }
 
-// ── lifecycle ───────────────────────────────────────────────
+// ── 生命周期 ─────────────────────────────────────────────────
+/**
+ * 初始化流程：
+ *   1. 拉取阿里云省级 GeoJSON → 清洗 → 注册到 ECharts
+ *   2. 关闭 loading（让 v-show 使图表 div 可见）
+ *   3. await nextTick 等待 DOM 更新（echarts.init 需要可见节点，否则 ZRender 取不到尺寸）
+ *   4. echarts.init 初始化实例 → setOption 渲染 → 绑定交互事件
+ */
 async function initChart() {
   if (!chartRef.value) return
 
@@ -232,19 +300,55 @@ async function initChart() {
     const res = await fetch('https://geo.datav.aliyun.com/areas_v3/bound/100000_full.json')
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const geoJson = await res.json()
+
+    /**
+     * echarts.registerMap(mapName, geoJSON, specialAreas?)
+     *   mapName    — 地图注册名，后续 series.map 引用此名称
+     *   geoJSON    — 符合 GeoJSON 规范的地图数据对象
+     *   specialAreas — 可选，将某些区域放大显示（如南海诸岛）
+     */
     echarts.registerMap('china', sanitizeGeoJson(geoJson))
 
-    // Turn off loading first so v-show reveals the chart div,
-    // then wait for the DOM update before calling echarts.init.
-    // Calling echarts.init on a display:none element causes ZRender
-    // to get null style values internally, leading to null[0] errors.
+    // 先关闭 loading 使图表容器可见，再等 DOM 刷新后初始化 ECharts，
+    // 避免在 display:none 节点上初始化导致 ZRender 取到 null 尺寸。
     loading.value = false
     await nextTick()
 
     if (!chartRef.value) return
+
+    /**
+     * echarts.init(dom, theme?, opts?)
+     *   dom    — 图表容器 DOM 节点（必须有确定的宽高）
+     *   theme  — 主题名称或主题配置对象（可选）
+     *   opts   — 初始化参数（可选），常用：
+     *              { renderer: 'canvas'|'svg', width, height, devicePixelRatio }
+     * 返回 ECharts 实例（ECharts 类型）
+     */
     chart = echarts.init(chartRef.value)
+
+    /**
+     * chart.setOption(option, opts?)
+     *   option — ECharts 配置项对象
+     *   opts   — 合并策略（可选）：
+     *              notMerge: true  — 不与旧 option 合并，完全替换（切换指标时使用）
+     *              lazyUpdate: true — 延迟更新（下一帧渲染，适合高频更新场景）
+     *              silent: true    — 不触发事件回调
+     */
     chart.setOption(buildOption(activeMetric.value))
 
+    /**
+     * chart.on(eventName, handler)
+     *   注册 ECharts 事件监听，常用事件：
+     *     'mouseover'  — 鼠标移入数据项
+     *     'mouseout'   — 鼠标移出数据项
+     *     'click'      — 点击数据项
+     *     'datazoom'   — 数据区域缩放
+     *   handler(params) 参数字段（地图系列）：
+     *     params.name      — 悬停省份名（已经过 nameMap 转换）
+     *     params.value     — 该省份数值
+     *     params.data      — 原始数据对象 { name, value }
+     *     params.seriesName — 系列名称
+     */
     chart.on('mouseover', (params: any) => {
       const d = allData[activeMetric.value].find(x => x.name === params.name)
       hoveredProvince.value = d ?? null
@@ -258,11 +362,22 @@ async function initChart() {
   }
 }
 
+/**
+ * 切换指标：更新响应式状态并用 notMerge 完全替换 option，
+ * 防止旧指标的 visualMap 范围残留到新指标上。
+ */
 function switchMetric(key: MetricKey) {
   activeMetric.value = key
+  // setOption 第二参数 { notMerge: true }：完全替换旧配置而非增量合并
   if (chart) chart.setOption(buildOption(key), { notMerge: true })
 }
 
+/**
+ * chart.resize(opts?)
+ *   通知 ECharts 容器尺寸已变化，重新计算布局。
+ *   opts 可选：{ width, height, animation: { duration, easing } }
+ *   必须在 window resize 事件中调用，否则图表不会自适应容器大小。
+ */
 function handleResize() { chart?.resize() }
 
 onMounted(() => {
@@ -272,6 +387,11 @@ onMounted(() => {
 
 onUnmounted(() => {
   window.removeEventListener('resize', handleResize)
+  /**
+   * chart.dispose()
+   *   销毁 ECharts 实例，释放 Canvas/SVG 资源与内存。
+   *   Vue 组件卸载时必须调用，否则 ZRender 内部定时器会持续占用内存。
+   */
   chart?.dispose()
   chart = null
 })
@@ -290,6 +410,7 @@ onUnmounted(() => {
         <span class="hm-badge">DEMO</span>
       </div>
 
+      <!-- 指标切换标签页：v-for 遍历三个指标键，点击调用 switchMetric -->
       <div class="hm-tabs">
         <button
           v-for="key in (['users', 'sales', 'growth'] as MetricKey[])"
@@ -303,13 +424,13 @@ onUnmounted(() => {
 
     <!-- Body -------------------------------------------------->
     <div class="hm-body">
-      <!-- Loading -->
+      <!-- 加载状态遮罩 -->
       <div v-if="loading" class="hm-overlay">
         <div class="hm-spinner"></div>
         <p>正在加载地图数据...</p>
       </div>
 
-      <!-- Error -->
+      <!-- 错误状态遮罩：点击「重新加载」时同步重置状态再触发 initChart -->
       <div v-else-if="loadError" class="hm-overlay error">
         <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10
           10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>
@@ -317,12 +438,12 @@ onUnmounted(() => {
         <button @click="initChart(); loading = true; loadError = ''">重新加载</button>
       </div>
 
-      <!-- Chart -->
+      <!-- ECharts 挂载容器：用 v-show 而非 v-if，保证 DOM 节点在 initChart 之前已存在 -->
       <div v-show="!loading && !loadError" ref="chartRef" class="hm-chart"></div>
 
-      <!-- Stats panel -->
+      <!-- 右侧统计面板 -->
       <aside v-if="!loading && !loadError" class="hm-stats">
-        <!-- Summary cards -->
+        <!-- 全国汇总卡片：增长率取均值，其他指标取总和 -->
         <div class="stat-card">
           <div class="stat-label">全国合计</div>
           <div class="stat-value">
@@ -334,6 +455,7 @@ onUnmounted(() => {
           <div class="stat-sub">{{ activeMetric === 'growth' ? '平均增长率' : '34 省市合计' }}</div>
         </div>
 
+        <!-- 最高值卡片 -->
         <div class="stat-card">
           <div class="stat-label">最高值</div>
           <div class="stat-value highlight">
@@ -342,7 +464,7 @@ onUnmounted(() => {
           <div class="stat-sub">{{ getTopN(activeMetric, 1)[0]?.name }}</div>
         </div>
 
-        <!-- Top 5 list -->
+        <!-- TOP 5 榜单：hoveredProvince 与地图 mouseover 事件联动高亮 -->
         <div class="rank-panel">
           <div class="rank-title">TOP 5 省市</div>
           <div
@@ -357,7 +479,7 @@ onUnmounted(() => {
           </div>
         </div>
 
-        <!-- Subtext -->
+        <!-- 数据来源副标题 -->
         <div class="hm-subtext">{{ metricConfig[activeMetric].subtext }}</div>
       </aside>
     </div>
